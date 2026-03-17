@@ -12,6 +12,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -437,8 +438,18 @@ func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
 		if resp.StatusCode == 400 {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			log.Printf("⚠️  400 error body: %s", string(errBody))
-			// Write the error response to the client
+			// Decompress gzip if needed
+			readable := errBody
+			if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
+				if gr, err := gzip.NewReader(bytes.NewReader(errBody)); err == nil {
+					if decoded, err := io.ReadAll(gr); err == nil {
+						readable = decoded
+					}
+					gr.Close()
+				}
+			}
+			log.Printf("⚠️  400 error body: %s", string(readable))
+			// Write the original (possibly compressed) error response to the client
 			for k, vv := range resp.Header {
 				for _, v := range vv {
 					w.Header().Add(k, v)
