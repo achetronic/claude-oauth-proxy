@@ -376,6 +376,84 @@ func postToken(body map[string]string) (*TokenSet, error) {
 	return nil, lastErr
 }
 
+// ── Billing header injection ─────────────────────────────────────────────────
+
+// proxyVersion is sent inside the billing header. Keep it aligned with
+// whatever Claude Code version Anthropic expects. Update when needed.
+const proxyVersion = "2.1.77"
+
+// billingHeaderPrefix is the marker Anthropic looks for in system[0].
+const billingHeaderPrefix = "x-anthropic-billing-header:"
+
+// injectBillingHeader ensures the Messages API body contains the billing
+// header that Anthropic requires for Sonnet/Opus models when using OAuth.
+// If the first system block already contains it, the body is returned as-is.
+// Only applies to JSON bodies that have a "system" field.
+func injectBillingHeader(body []byte) []byte {
+	// Quick check: if it already contains the billing header, skip parsing
+	if bytes.Contains(body, []byte(billingHeaderPrefix)) {
+		return body
+	}
+
+	// Parse just enough to check/inject the system field
+	var msg map[string]json.RawMessage
+	if err := json.Unmarshal(body, &msg); err != nil {
+		return body
+	}
+
+	// Only inject if there's a "messages" field (i.e., this is a Messages API call)
+	if _, ok := msg["messages"]; !ok {
+		return body
+	}
+
+	billingBlock := map[string]string{
+		"type": "text",
+		"text": fmt.Sprintf("%s cc_version=%s; cc_entrypoint=cli; cch=00000;", billingHeaderPrefix, proxyVersion),
+	}
+	billingJSON, _ := json.Marshal(billingBlock)
+
+	sysRaw, hasSystem := msg["system"]
+
+	if !hasSystem || len(bytes.TrimSpace(sysRaw)) == 0 {
+		// No system field: create one with just the billing block
+		msg["system"] = json.RawMessage(fmt.Sprintf("[%s]", billingJSON))
+	} else {
+		trimmed := bytes.TrimSpace(sysRaw)
+		if trimmed[0] == '[' {
+			// system is an array: prepend the billing block
+			var sysArr []json.RawMessage
+			if err := json.Unmarshal(trimmed, &sysArr); err != nil {
+				return body
+			}
+			sysArr = append([]json.RawMessage{billingJSON}, sysArr...)
+			newSys, _ := json.Marshal(sysArr)
+			msg["system"] = json.RawMessage(newSys)
+		} else if trimmed[0] == '"' {
+			// system is a plain string: convert to array with billing + original
+			var sysStr string
+			if err := json.Unmarshal(trimmed, &sysStr); err != nil {
+				return body
+			}
+			origBlock, _ := json.Marshal(map[string]interface{}{
+				"type": "text",
+				"text": sysStr,
+				"cache_control": map[string]string{"type": "ephemeral", "ttl": "1h"},
+			})
+			msg["system"] = json.RawMessage(fmt.Sprintf("[%s,%s]", billingJSON, origBlock))
+		} else {
+			// system is something else (object?): leave as-is
+			return body
+		}
+	}
+
+	newBody, err := json.Marshal(msg)
+	if err != nil {
+		return body
+	}
+	log.Println("💉  Injected billing header into system prompt")
+	return newBody
+}
+
 // ── Proxy handler ────────────────────────────────────────────────────────────
 
 func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
@@ -385,6 +463,11 @@ func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(502)
 		fmt.Fprintf(w, `{"error":{"message":"%s","type":"proxy_error"}}`, err.Error())
 		return
+	}
+
+	// Inject billing header for Messages API if not already present
+	if r.Method == "POST" && strings.HasPrefix(r.RequestURI, "/v1/messages") {
+		body = injectBillingHeader(body)
 	}
 
 	const maxAttempts = 5
