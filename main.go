@@ -38,8 +38,8 @@ import (
 const (
 	claudeClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 	authEndpoint   = "https://claude.ai/oauth/authorize"
-	tokenEndpoint  = "https://console.anthropic.com/v1/oauth/token"
-	oauthScopes    = "org:create_api_key user:profile user:inference"
+	tokenEndpoint  = "https://platform.claude.com/v1/oauth/token"
+	oauthScopes    = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 	anthropicAPI   = "https://api.anthropic.com"
 )
 
@@ -159,7 +159,7 @@ func (p *Proxy) runOAuthFlow() *TokenSet {
 	verifier, challenge := generatePKCE()
 	state := randomBase64URL(32)
 
-	redirectURI := "https://console.anthropic.com/oauth/code/callback"
+	redirectURI := "https://platform.claude.com/oauth/code/callback"
 
 	authURL := buildAuthURL(challenge, state, redirectURI)
 
@@ -407,17 +407,21 @@ func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		outReq.Header.Set("Authorization", p.currentBearer())
-		if outReq.Header.Get("Anthropic-Beta") == "" {
+
+		// Ensure oauth-2025-04-20 is present in Anthropic-Beta (required for OAuth tokens)
+		// but preserve any other beta flags the client sends.
+		existing := outReq.Header.Get("Anthropic-Beta")
+		if existing == "" {
 			outReq.Header.Set("Anthropic-Beta", "oauth-2025-04-20")
-		} else {
-			existing := outReq.Header.Get("Anthropic-Beta")
-			if !strings.Contains(existing, "oauth-2025-04-20") {
-				outReq.Header.Set("Anthropic-Beta", "oauth-2025-04-20,"+existing)
-			}
+		} else if !strings.Contains(existing, "oauth-2025-04-20") {
+			outReq.Header.Set("Anthropic-Beta", existing+",oauth-2025-04-20")
 		}
+		// Do NOT set anthropic-version here — let the client decide.
+		// If the client doesn't send it, Anthropic uses its default.
 		outReq.Host = "api.anthropic.com"
 
 		log.Printf("[→] %s %s (attempt %d/%d)", r.Method, r.RequestURI, attempt+1, maxAttempts)
+		log.Printf("    Anthropic-Beta: %s", outReq.Header.Get("Anthropic-Beta"))
 
 		resp, err := p.httpClient.Do(outReq)
 		if err != nil {
@@ -428,6 +432,22 @@ func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 
 		log.Printf("[←] %d  %s", resp.StatusCode, r.RequestURI)
+
+		// Log the response body on 400 errors for debugging
+		if resp.StatusCode == 400 {
+			errBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			log.Printf("⚠️  400 error body: %s", string(errBody))
+			// Write the error response to the client
+			for k, vv := range resp.Header {
+				for _, v := range vv {
+					w.Header().Add(k, v)
+				}
+			}
+			w.WriteHeader(400)
+			w.Write(errBody)
+			return
+		}
 
 		if resp.StatusCode == 401 && attempt == 0 {
 			resp.Body.Close()
