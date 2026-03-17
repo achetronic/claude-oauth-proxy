@@ -12,6 +12,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -38,8 +39,8 @@ import (
 const (
 	claudeClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 	authEndpoint   = "https://claude.ai/oauth/authorize"
-	tokenEndpoint  = "https://console.anthropic.com/v1/oauth/token"
-	oauthScopes    = "org:create_api_key user:profile user:inference"
+	tokenEndpoint  = "https://platform.claude.com/v1/oauth/token"
+	oauthScopes    = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 	anthropicAPI   = "https://api.anthropic.com"
 )
 
@@ -159,7 +160,7 @@ func (p *Proxy) runOAuthFlow() *TokenSet {
 	verifier, challenge := generatePKCE()
 	state := randomBase64URL(32)
 
-	redirectURI := "https://console.anthropic.com/oauth/code/callback"
+	redirectURI := "https://platform.claude.com/oauth/code/callback"
 
 	authURL := buildAuthURL(challenge, state, redirectURI)
 
@@ -375,6 +376,84 @@ func postToken(body map[string]string) (*TokenSet, error) {
 	return nil, lastErr
 }
 
+// ── Billing header injection ─────────────────────────────────────────────────
+
+// proxyVersion is sent inside the billing header. Keep it aligned with
+// whatever Claude Code version Anthropic expects. Update when needed.
+const proxyVersion = "2.1.77"
+
+// billingHeaderPrefix is the marker Anthropic looks for in system[0].
+const billingHeaderPrefix = "x-anthropic-billing-header:"
+
+// injectBillingHeader ensures the Messages API body contains the billing
+// header that Anthropic requires for Sonnet/Opus models when using OAuth.
+// If the first system block already contains it, the body is returned as-is.
+// Only applies to JSON bodies that have a "system" field.
+func injectBillingHeader(body []byte) []byte {
+	// Quick check: if it already contains the billing header, skip parsing
+	if bytes.Contains(body, []byte(billingHeaderPrefix)) {
+		return body
+	}
+
+	// Parse just enough to check/inject the system field
+	var msg map[string]json.RawMessage
+	if err := json.Unmarshal(body, &msg); err != nil {
+		return body
+	}
+
+	// Only inject if there's a "messages" field (i.e., this is a Messages API call)
+	if _, ok := msg["messages"]; !ok {
+		return body
+	}
+
+	billingBlock := map[string]string{
+		"type": "text",
+		"text": fmt.Sprintf("%s cc_version=%s; cc_entrypoint=cli; cch=00000;", billingHeaderPrefix, proxyVersion),
+	}
+	billingJSON, _ := json.Marshal(billingBlock)
+
+	sysRaw, hasSystem := msg["system"]
+
+	if !hasSystem || len(bytes.TrimSpace(sysRaw)) == 0 {
+		// No system field: create one with just the billing block
+		msg["system"] = json.RawMessage(fmt.Sprintf("[%s]", billingJSON))
+	} else {
+		trimmed := bytes.TrimSpace(sysRaw)
+		if trimmed[0] == '[' {
+			// system is an array: prepend the billing block
+			var sysArr []json.RawMessage
+			if err := json.Unmarshal(trimmed, &sysArr); err != nil {
+				return body
+			}
+			sysArr = append([]json.RawMessage{billingJSON}, sysArr...)
+			newSys, _ := json.Marshal(sysArr)
+			msg["system"] = json.RawMessage(newSys)
+		} else if trimmed[0] == '"' {
+			// system is a plain string: convert to array with billing + original
+			var sysStr string
+			if err := json.Unmarshal(trimmed, &sysStr); err != nil {
+				return body
+			}
+			origBlock, _ := json.Marshal(map[string]interface{}{
+				"type": "text",
+				"text": sysStr,
+				"cache_control": map[string]string{"type": "ephemeral", "ttl": "1h"},
+			})
+			msg["system"] = json.RawMessage(fmt.Sprintf("[%s,%s]", billingJSON, origBlock))
+		} else {
+			// system is something else (object?): leave as-is
+			return body
+		}
+	}
+
+	newBody, err := json.Marshal(msg)
+	if err != nil {
+		return body
+	}
+	log.Println("💉  Injected billing header into system prompt")
+	return newBody
+}
+
 // ── Proxy handler ────────────────────────────────────────────────────────────
 
 func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
@@ -384,6 +463,11 @@ func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(502)
 		fmt.Fprintf(w, `{"error":{"message":"%s","type":"proxy_error"}}`, err.Error())
 		return
+	}
+
+	// Inject billing header for Messages API if not already present
+	if r.Method == "POST" && strings.HasPrefix(r.RequestURI, "/v1/messages") {
+		body = injectBillingHeader(body)
 	}
 
 	const maxAttempts = 5
@@ -407,17 +491,21 @@ func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		outReq.Header.Set("Authorization", p.currentBearer())
-		if outReq.Header.Get("Anthropic-Beta") == "" {
+
+		// Ensure oauth-2025-04-20 is present in Anthropic-Beta (required for OAuth tokens)
+		// but preserve any other beta flags the client sends.
+		existing := outReq.Header.Get("Anthropic-Beta")
+		if existing == "" {
 			outReq.Header.Set("Anthropic-Beta", "oauth-2025-04-20")
-		} else {
-			existing := outReq.Header.Get("Anthropic-Beta")
-			if !strings.Contains(existing, "oauth-2025-04-20") {
-				outReq.Header.Set("Anthropic-Beta", "oauth-2025-04-20,"+existing)
-			}
+		} else if !strings.Contains(existing, "oauth-2025-04-20") {
+			outReq.Header.Set("Anthropic-Beta", existing+",oauth-2025-04-20")
 		}
+		// Do NOT set anthropic-version here — let the client decide.
+		// If the client doesn't send it, Anthropic uses its default.
 		outReq.Host = "api.anthropic.com"
 
 		log.Printf("[→] %s %s (attempt %d/%d)", r.Method, r.RequestURI, attempt+1, maxAttempts)
+		log.Printf("    Anthropic-Beta: %s", outReq.Header.Get("Anthropic-Beta"))
 
 		resp, err := p.httpClient.Do(outReq)
 		if err != nil {
@@ -428,6 +516,32 @@ func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 
 		log.Printf("[←] %d  %s", resp.StatusCode, r.RequestURI)
+
+		// Log the response body on 400 errors for debugging
+		if resp.StatusCode == 400 {
+			errBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			// Decompress gzip if needed
+			readable := errBody
+			if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
+				if gr, err := gzip.NewReader(bytes.NewReader(errBody)); err == nil {
+					if decoded, err := io.ReadAll(gr); err == nil {
+						readable = decoded
+					}
+					gr.Close()
+				}
+			}
+			log.Printf("⚠️  400 error body: %s", string(readable))
+			// Write the original (possibly compressed) error response to the client
+			for k, vv := range resp.Header {
+				for _, v := range vv {
+					w.Header().Add(k, v)
+				}
+			}
+			w.WriteHeader(400)
+			w.Write(errBody)
+			return
+		}
 
 		if resp.StatusCode == 401 && attempt == 0 {
 			resp.Body.Close()
