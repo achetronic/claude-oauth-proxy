@@ -128,7 +128,7 @@ func main() {
 	p.httpClient = &http.Client{
 		Timeout: 0,
 		Transport: &http.Transport{
-			ResponseHeaderTimeout:  30 * time.Second,
+			ResponseHeaderTimeout:  5 * time.Minute,
 			IdleConnTimeout:        90 * time.Second,
 			TLSHandshakeTimeout:    10 * time.Second,
 			ExpectContinueTimeout:  1 * time.Second,
